@@ -2,6 +2,11 @@
 
 A Claude Code skill that builds a Nikon Flexible Color Picture Control (`.NP3`) to match a reference look, such as a Fujifilm film simulation.
 
+
+## Download the profile, LUT and RAW files
+
+Get the free Nikon profile, LUT and RAW chart files here:
+https://gerardneedham.com/en-au/products/fujifilm-astia-for-nikon-zf-free-profile-lut-and-raw-chart-files
 It works by measurement:
 
 1. Shoot the same colour chart on both cameras, in the same light.
