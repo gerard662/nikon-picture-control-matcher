@@ -15,6 +15,33 @@ It works by measurement:
 
 ---
 
+## TL;DR — Cloning Any Fuji Film Sim (or Custom Recipe) via Raw File Converter EX 3.0
+
+Using the downloadable sample Nikon `.NEF` + Fuji `.RAF` chart files (works **without** needing a physical Fuji camera plugged in for X RAW Studio):
+
+1. **Nikon baseline (`files/nikon/`)**: Put these 6 `.NEF` files into `files/nikon/`:
+   - `NZF_7427.NEF`, `NZF_7428.NEF`, `NZF_7429.NEF`, `NZF_7430.NEF`, `NZF_7431.NEF`, `NZF_7433.NEF`
+2. **Export your Fuji look (`files/fuji_<filmsim>/`)**: Open the matching 5 Fuji `.RAF` files (`DSCF0064.RAF`, `DSCF0065.RAF`, `DSCF0066.RAF`, `DSCF0067.RAF`, `DSCF0080.RAF`) in **Fujifilm Raw File Converter EX 3.0** (powered by SILKYPIX) and export as **`sRGB` JPEG** at **`6048×4032`**:
+   - Exact filenames expected in `files/fuji_<filmsim>/` (e.g. `files/fuji_nostalgic_neg/`):
+     - `DSCF0064.jpg` (`1/30s` ↔ `NZF_7431.NEF`, train)
+     - `DSCF0065.jpg` (`1/40s` ↔ `NZF_7427.NEF`, train)
+     - `DSCF0066.jpg` (`1/52s` ↔ `NZF_7430.NEF`, test)
+     - `DSCF0067.jpg` (`1/80s` ↔ `NZF_7428.NEF`, train)
+     - `DSCF0080.jpg` (`1/60s` ↔ `NZF_7429.NEF`, test)
+     - `DSCF0064_+0.2EV.jpg` (`DSCF0064.RAF` pushed `+0.2 EV` in Raw File Converter EX 3.0 ↔ `NZF_7433.NEF`, optional exposure-leveled test)
+   - Pick your base **Film Simulation** (e.g. Classic Neg, Nostalgic Neg, Classic Chrome, Astia) — **or dial in your full Fuji recipe** (**Color / Saturation** e.g. `+1..+4`, **Highlight / Shadow Tone**, **Contrast**, and an optional mild **WB shift**).
+   - **Why bake adjustments in before matching?** Flexible Color `.NP3` profiles with a custom tone curve disable NX Studio's simple Contrast/Highlights/Shadows sliders. Baking your preferred tone, highlight/shadow roll-off, and saturation into the Fuji export lets the fitter capture your _finished_ look directly in the `.NP3`'s 257-entry tone LUT and 8-band Color Blender.
+   - Keep **DR100**, **Grain Off**, **Color Chrome Off**, and **Sharpness / NR** low; avoid clipping bright white patches (`>= 0.995`) or crushing blacks to `0`.
+   - _Note on Raw File Converter EX 3.0 vs in-camera / X RAW Studio:_ Exporting from `.RAF` in Raw File Converter EX 3.0 works seamlessly with `./match` (no changes needed to the script, as long as you export `.jpg` rather than putting `.RAF`s in `files/`). Just keep in mind Raw File Converter EX 3.0 uses SILKYPIX's film-sim processing rather than the camera's own X-Processor hardware, which can differ subtly from straight-out-of-camera Fuji JPEGs.
+3. **Run one command**:
+   ```zsh
+   ./match <filmsim>
+   ```
+   Your finished `<filmsim>_YYYY-MM-DD.NP3` lands in the project root (and SD-card-ready `NIKON/CUSTOMPC/PICCONnn.NP3` inside `profiles/`).
+4. **Tweaking later**: Saturation can still be adjusted freely in NX Studio / in-camera; if you want different contrast or highlight/shadow tone, export a tweaked Fuji set and re-run `./match`.
+
+---
+
 ## Quick Start (`./match`)
 
 Once your chart corners are calibrated in `reference/chart_corners.json`, matching any new Fuji film simulation requires only dropping the Fuji JPEGs into `files/fuji_<filmsim>/` and running one command:
