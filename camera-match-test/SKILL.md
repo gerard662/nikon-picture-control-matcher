@@ -22,7 +22,7 @@ For a cross-camera reference (Fuji to Nikon), the chart pair must differ only in
 - Shoot at least three pairs, moving the chart or exposure slightly between them, so some pairs can be held back as a fair test.
 - Exposure brackets work well as pairs: match each Nikon frame to the Fuji frame with the same exposure offset (check `ExposureCompensation` and shutter speed with exiftool rather than trusting file order). With five brackets, fit on the three middle pairs and hold back the two ends.
 - The two cameras can frame differently (different focal lengths, lens corrections, crop). That's fine, because each image gets its own chart corners and only patch averages are compared. The whole chart just needs to be in frame and in focus on both.
-- A ColorChecker beside the CMP chart is handy for eyeballing white balance and accuracy on screen, but the fitter only measures the CMP chart.
+- A ColorChecker beside the CMP chart is great both for true-neutral white balance (`wb_chart: "cc24"`) and explicit skin-tone measurement (`Light Skin` / `Dark Skin`), and additional cards (Magic Palette, Tiffen Color Control / Gray Scale) can be included via `charts` + per-pair `nef_charts` / `target_charts`.
 - HEIF targets are converted to sRGB with macOS `sips`, which writes 8 bits. That's fine, because each patch averages thousands of pixels.
 - Use the Fuji's own JPEG or HEIF as the target, not its RAF. That file is the film simulation; a RAF would need a raw converter, which brings in that converter's look instead of Fuji's.
 
@@ -42,29 +42,38 @@ Scripts live in `scripts/` next to this file. Run them with `python3 <skill>/scr
      "start_np3": "<skill>/assets/flexible_color_template.NP3",
      "match_exposure": false,
      "neutralize_wb": "nikon",
-     "weighting": "everyday",
-     "rounds": 3,
+     "weighting": "skin_magic",
+     "rounds": 4,
      "pairs": [
-       {"id": "A", "nef": ".../NZF_0001.NEF", "target": ".../DSCF0001.HIF", "role": "train", "camera_jpeg": ".../NZF_0001.JPG",
-        "nef_corners": [0,0, 0,0, 0,0, 0,0], "target_corners": [0,0, 0,0, 0,0, 0,0]},
-       {"id": "B", "...": "...", "role": "test"}
+       {
+         "id": "A",
+         "nef": ".../NZF_0001.NEF",
+         "target": ".../DSCF0001.HIF",
+         "role": "train",
+         "camera_jpeg": ".../NZF_0001.JPG",
+         "nef_corners": [0, 0, 0, 0, 0, 0, 0, 0],
+         "target_corners": [0, 0, 0, 0, 0, 0, 0, 0]
+       },
+       { "id": "B", "...": "...", "role": "test" }
      ]
    }
    ```
 
    - `name` is what appears on the camera: ASCII, 19 characters at most. Use the rev numbering (`R01`, `R02` …) so nothing is ever overwritten.
-   - `start_np3` must be a Flexible Color NP3 with a custom tone curve. The bundled `flexible_color_template.NP3` works as a template for any look: `fit` also tries a neutral-colour start from the same file and keeps whichever fits better.
-   - `neutralize_wb` corrects white balance using the chart's grey patches (outer grey ring plus every patch that reads near-neutral, refined over a few passes):
+   - `start_np3` must be a Flexible Color NP3 with a custom tone curve. The bundled `flexible_color_template.NP3` works as a template for any look: `fit` tries an analytical 1D tone-curve pre-fit (`also_fitted_curve`) and/or the template start (`also_template_start`) and keeps whichever fits better.
+   - `weighting`: `"skin_magic"` (prioritizes skin tones, neutral ramp split-toning, and everyday colours while down-weighting extreme primaries), `"everyday"`, or `"uniform"`.
+   - `neutralize_wb` corrects white balance using a true linear-neutral render of the NEF (never contaminated by the starting template's colour grading), preferring ColorChecker neutral greys (`cc24`) when present or falling back to the CMP grey ring:
      - `"nikon"`: balance only the Nikon render to neutral and keep the reference exactly as shot. Use this when the reference's colour cast is part of the look, for example a Fuji recipe with a WB shift (check `WhiteBalance` and `WhiteBalanceFineTune` in the Fuji's metadata). The profile then learns that warmth or coolness as a tint, and the Nikon can shoot on auto WB in the field.
      - `"both"`: balance both images to neutral. Use this when any cast is unwanted (different light, accidental mismatch), so the profile learns colour only.
      - `false`: compare as shot. Use this when both cameras used the same fixed Kelvin.
-     The log shows the correction each image needed. A few percent is normal; much more means the cameras saw different light or one was set badly.
+       The log shows the correction each image needed. A few percent is normal; much more means the cameras saw different light or one was set badly.
    - Corners are the centres of patches **A1, A38, Z1, Z38** in full-resolution pixels of that image, as `[x1,y1, x2,y2, x3,y3, x4,y4]`. Go by the printed row letters and column numbers, not by screen position, because the chart is often shot rotated or upside down; A1 can be at the bottom right. NEF corners are in the camera-JPEG geometry (NX renders apply the camera's lens corrections, so they line up with the camera JPEG, not with a Lightroom export).
+
 3. **`preview`** writes ruler previews of each NEF render and each target. Look at them and read off the four corner patch centres; rough is fine (within half a patch).
 4. **`grid`** refines the corners, writes overlay images, and saves a `_grid.json` config. Look at every overlay: each yellow box must sit inside a single patch. Use the `_grid.json` from here on.
 5. **`score`** gives the starting point and, if `camera_jpeg` is set, what the camera currently produces. Report this baseline before fitting.
 6. **`fit`** (runs 10–40 minutes, so start it in the background and tell the user roughly how long). It writes `<output_dir>/<name>/NIKON/CUSTOMPC/PICCONnn.NP3` plus `settings.json`, and never overwrites: if the folder exists it adds `_rev2`, `_rev3`.
-7. **Report honestly.** Lead with held-out ΔE2000 (pairs with `role: test`), then fitted pairs, everyday colours and neutrals. Mention controls stuck at their limits, because they mean the format ran out of room. 
+7. **Report honestly.** Lead with held-out ΔE2000 (pairs with `role: test`), then fitted pairs, everyday colours and neutrals. Mention controls stuck at their limits, because they mean the format ran out of room.
 8. **Copy to the card only when the user says so**: `cp -n` into `<card>/NIKON/CUSTOMPC/`, creating that folder if needed, then compare checksums. Camera menu: Photo Shooting Menu → Manage Picture Control → Load/save → Copy to camera, then Set Picture Control.
 9. **Verify on camera.** Before scoring any camera JPEG, read its `PictureControlName` with exiftool. Then run `score` with that JPEG as `camera_jpeg`.
 
