@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Shared tools: NP3 read/write, NX Studio SaveProcess rendering, CMP chart measurement, colour maths."""
-import base64, math, os, struct, subprocess, tempfile
+import base64, math, os, shutil, struct, subprocess, tempfile
 import numpy as np, cv2, tifffile
 from xml.sax.saxutils import escape
 from scipy.interpolate import PchipInterpolator
@@ -12,7 +12,7 @@ SRGB_ICC = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
 ROWS, COLS = 26, 38  # CMP Digital Target Ultimate: rows A-Z, columns 1-38, 988 patches
 BANDS = ["red", "orange", "yellow", "green", "cyan", "blue", "purple", "magenta"]
 ZONES = ("high", "mid", "shadow")
-KNOTS = np.array([.05, .12, .2, .3, .42, .55, .7, .85, .95])
+KNOTS = np.array([.0, .04, .08, .13, .20, .28, .38, .50, .62, .74, .85, .93, 1.0])
 
 
 # ---------- NP3 ----------
@@ -55,26 +55,50 @@ class Template:
     def _params(self):
         b, P = self.base, []
         for i, n in enumerate(BANDS):
-            P += [(f"{n}_hue", b[self.BL + 3 * i] - 0x80, 10, -70, 70), (f"{n}_chroma", b[self.BL + 3 * i + 1] - 0x80, 12, -100, 100),
-                  (f"{n}_bright", b[self.BL + 3 * i + 2] - 0x80, 10, -60, 60)]
-        P += [("saturation", b[self.SAT] - 0x80, 10, -50, 50)]
+            P += [(f"{n}_hue", b[self.BL + 3 * i] - 0x80, 10, -100, 100), (f"{n}_chroma", b[self.BL + 3 * i + 1] - 0x80, 12, -100, 100),
+                  (f"{n}_bright", b[self.BL + 3 * i + 2] - 0x80, 10, -100, 100)]
+        P += [("saturation", b[self.SAT] - 0x80, 10, -100, 100)]
         for j, z in enumerate(ZONES):
             o = self.GR + 4 * j
             hue = ((b[o] & 0x0F) << 8) + b[o + 1]
             ch = b[o + 2] - 0x80
-            P += [(f"grade_{z}_x", ch * math.cos(math.radians(hue)), 12, -50, 50), (f"grade_{z}_y", ch * math.sin(math.radians(hue)), 12, -50, 50),
-                  (f"grade_{z}_bright", b[o + 3] - 0x80, 10, -40, 40)]
-        P += [("grade_blending", b[self.GR + 16] - 0x80, 20, 0, 100), ("grade_balance", b[self.GR + 18] - 0x80, 20, -60, 60)]
-        P += [(f"curve_{k:.2f}", 0, 6, -25, 25) for k in KNOTS]
+            P += [(f"grade_{z}_x", ch * math.cos(math.radians(hue)), 12, -80, 80), (f"grade_{z}_y", ch * math.sin(math.radians(hue)), 12, -80, 80),
+                  (f"grade_{z}_bright", b[o + 3] - 0x80, 10, -100, 100)]
+        P += [("grade_blending", b[self.GR + 16] - 0x80, 20, 0, 100), ("grade_balance", b[self.GR + 18] - 0x80, 20, -100, 100)]
+        for k in KNOTS:
+            if k == 0.0:
+                P.append(("curve_0.00", 0, 4, 0, 20))
+            elif k == 1.0:
+                P.append(("curve_1.00", 0, 4, -20, 0))
+            else:
+                P.append((f"curve_{k:.2f}", 0, 8, -55, 55))
         return P
 
-    def start(self, reset_colour=False):
+    def start(self, reset_colour=False, reset_curve=False):
         x = np.array([p[1] for p in self.params], float)
-        if reset_colour:  # neutral colour controls, keep the template's tone curve
-            for i, n in enumerate(self.names):
-                if not n.startswith("curve_"):
-                    x[i] = 50 if n == "grade_blending" else 0
+        for i, n in enumerate(self.names):
+            if reset_colour and not n.startswith("curve_"):
+                x[i] = 50 if n == "grade_blending" else 0
+            elif reset_curve and n.startswith("curve_"):
+                k = float(n.split("_")[1])
+                x[i] = (k - float(np.interp(k, np.arange(257) / 256, self.lut))) * 255
         return np.clip(x, self.lo, self.hi)
+
+    def neutral_base(self):
+        """Return NP3 bytes with neutral colour controls and an exact linear 0..1 tone curve."""
+        b = bytearray(self.make(self.start(reset_colour=True)))
+        px = np.round(np.linspace(0, 255, 20)).astype(int)
+        lut16 = np.round(np.linspace(0, 32767, 257)).astype(int)
+        b[self.CU + 8] = 20
+        b[self.CU + 9:self.CU + 49] = bytes(int(q) for pair in zip(px, px) for q in pair)
+        b[self.CU + 64:self.CU + 578] = struct.pack(">257H", *lut16.tolist())
+        return bytes(b)
+
+    def curve_params_for_lut(self, target_lut):
+        """Convert a 257-entry [0, 1] tone LUT into curve knot deltas relative to this template."""
+        src = np.interp(KNOTS, np.arange(257) / 256, self.lut)
+        dst = np.interp(KNOTS, np.arange(257) / 256, target_lut)
+        return (dst - src) * 255
 
     def make(self, x, name=None):
         b = bytearray(self.base)
@@ -93,10 +117,13 @@ class Template:
         b[self.GR + 18] = 0x80 + int(round(v["grade_balance"]))
         deltas = np.array([v[f"curve_{k:.2f}"] for k in KNOTS]) / 255
         if np.any(np.round(deltas * 255)):
-            fix = PchipInterpolator(np.r_[0, KNOTS, 1], np.r_[0, deltas, 0])(np.arange(257) / 256)
+            fix = PchipInterpolator(KNOTS, deltas)(np.arange(257) / 256)
             lut = np.maximum.accumulate(np.clip(self.lut + fix, 0, 1))
             lut16 = np.round(lut * 32767).astype(int)
-            lut16[0], lut16[-1] = 0, 32767
+            if round(deltas[0] * 255) == 0:
+                lut16[0] = 0
+            if round(deltas[-1] * 255) == 0:
+                lut16[-1] = 32767
             # Nikon's software rebuilds the curve from the control points, so write points that follow the LUT
             px = np.round(np.linspace(0, 255, 20)).astype(int)
             py = np.maximum.accumulate(np.round(np.interp(px * 256 / 255, np.arange(257), lut16 / 32767) * 255).astype(int))
@@ -168,8 +195,16 @@ def render(nef, np3, width, workdir):
 # ---------- reference images ----------
 
 def profile_of(path):
-    r = subprocess.run(["exiftool", "-s3", "-ProfileDescription", "-BitsPerSample", path], capture_output=True, text=True)
-    return r.stdout.strip().replace("\n", " | ")
+    if shutil.which("exiftool"):
+        r = subprocess.run(["exiftool", "-s3", "-ProfileDescription", "-BitsPerSample", path], capture_output=True, text=True)
+        return r.stdout.strip().replace("\n", " | ")
+    r = subprocess.run(["sips", "-g", "profile", "-g", "bitsPerSample", path], capture_output=True, text=True)
+    vals = {}
+    for line in r.stdout.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            vals[k.strip()] = v.strip()
+    return f"{vals.get('profile', '')} | {vals.get('bitsPerSample', '')}".strip(" |")
 
 
 def load_reference(path, workdir):
@@ -203,47 +238,86 @@ def grid_points(corners, u, v):
     return p[..., :2] / p[..., 2:]
 
 
-def uv(fr, n):
-    cc, rr = np.meshgrid(np.arange(COLS), np.arange(ROWS))
+def uv(fr, n, rows=ROWS, cols=COLS):
+    cc, rr = np.meshgrid(np.arange(cols), np.arange(rows))
     o = np.linspace(-fr / 2, fr / 2, n)
     ox, oy = np.meshgrid(o, o)
-    return (cc[..., None, None] + ox) / (COLS - 1), (rr[..., None, None] + oy) / (ROWS - 1)
+    return (cc[..., None, None] + ox) / max(cols - 1, 1), (rr[..., None, None] + oy) / max(rows - 1, 1)
 
 
-def locate(img, guess):
-    """Refine the four corner patch centres (A1, A38, Z1, Z38) by making every patch as uniform as possible."""
+def locate(img, guess, rows=ROWS, cols=COLS, fr=.55, coarse=True):
+    """Refine the four corner patch centres by making every patch as uniform as possible."""
     g = cv2.GaussianBlur(img.mean(2), (0, 0), 2)
-    u, v = uv(.55, 7)
+    u, v = uv(fr, 7, rows, cols)
+    best = np.asarray(guess, float)
+    scale = max(img.shape[:2]) / 6048
+
+    if coarse:
+        base_c = best.reshape(4, 2)
+        center = base_c.mean(0)
+
+        def cost_aff(p):
+            dx, dy = p[0], p[1]
+            sx = p[2] if (rows > 2 and cols > 2) else 1.0
+            sy = p[3] if (rows > 2 and cols > 2) else 1.0
+            # Keep scale near 1.0 so thin strips never collapse onto a single row/column
+            if not (0.94 <= sx <= 1.06 and 0.94 <= sy <= 1.06):
+                return 1e6
+            c = (base_c - center) * np.array([sx, sy]) + center + np.array([dx, dy])
+            pts = grid_points(c.ravel(), u, v)
+            return map_coordinates(g, [pts[..., 1].ravel(), pts[..., 0].ravel()], order=1).reshape(pts.shape[:-1]).std(axis=(2, 3)).mean()
+
+        p0 = [0.0, 0.0, 1.0, 1.0] if (rows > 2 and cols > 2) else [0.0, 0.0]
+        d0 = np.diag([12 * scale, 12 * scale, 0.015, 0.015]) if (rows > 2 and cols > 2) else np.diag([12 * scale, 12 * scale])
+        res = minimize(cost_aff, p0, method="Powell", options=dict(xtol=1e-3, ftol=1e-7, direc=d0, maxiter=20)).x
+        sx = res[2] if (rows > 2 and cols > 2) else 1.0
+        sy = res[3] if (rows > 2 and cols > 2) else 1.0
+        best = ((base_c - center) * np.array([sx, sy]) + center + np.array([res[0], res[1]])).ravel()
 
     def cost(c):
         p = grid_points(c, u, v)
         return map_coordinates(g, [p[..., 1].ravel(), p[..., 0].ravel()], order=1).reshape(p.shape[:-1]).std(axis=(2, 3)).mean()
 
-    best = np.asarray(guess, float)
-    scale = max(img.shape[:2]) / 6048
-    for step in (24, 8, 3):
-        best = minimize(cost, best, method="Powell", options=dict(xtol=.2, ftol=1e-7, direc=np.eye(8) * step * scale, maxiter=20)).x
+    if rows > 2 and cols > 2:
+        steps = (8, 3, 1) if coarse else (24, 8, 3)
+        for step in steps:
+            best = minimize(cost, best, method="Powell", options=dict(xtol=.15, ftol=1e-7, direc=np.eye(8) * step * scale, maxiter=20)).x
     return best, float(cost(best))
 
 
-def measure(img, corners):
-    u, v = uv(.5, 11)
+def measure(img, corners, rows=ROWS, cols=COLS, fr=.5, trim=.2):
+    u, v = uv(fr, 13, rows, cols)
     p = grid_points(corners, u, v)
-    m = np.zeros((ROWS, COLS, 3))
+    m = np.zeros((rows, cols, 3))
     for k in range(3):
-        m[..., k] = np.median(map_coordinates(img[..., k], [p[..., 1].ravel(), p[..., 0].ravel()], order=1).reshape(p.shape[:-1]), axis=(2, 3))
+        vals = map_coordinates(img[..., k], [p[..., 1].ravel(), p[..., 0].ravel()], order=1).reshape(rows, cols, -1)
+        if trim >= 0.49:
+            m[..., k] = np.median(vals, axis=-1)
+        elif trim > 0:
+            s = np.sort(vals, axis=-1)
+            q = max(1, int(s.shape[-1] * trim))
+            m[..., k] = s[..., q:-q].mean(-1)
+        else:
+            m[..., k] = vals.mean(-1)
     return m
 
 
-def overlay(img, corners, valid, path):
+def overlay(img, charts, valid, path):
+    """Draw patch sampling boxes. `charts` can be a single 8-element corner list or [(corners, rows, cols, fr, valid_slice), ...]."""
     sc = 1512 / img.shape[1]
     small = (cv2.resize(np.clip(img, 0, 1), (1512, int(img.shape[0] * sc)), interpolation=cv2.INTER_AREA)[..., ::-1] * 255).astype(np.uint8).copy()
-    u, v = uv(.5, 2)
-    p = grid_points(corners, u, v) * sc
-    for r in range(ROWS):
-        for q in range(COLS):
-            a = p[r, q]
-            cv2.rectangle(small, tuple(a[0, 0].astype(int)), tuple(a[1, 1].astype(int)), (0, 255, 255) if valid is None or valid[r, q] else (0, 0, 255), 1)
+    if isinstance(charts, (list, tuple)) and len(charts) == 8 and not isinstance(charts[0], (list, tuple)):
+        charts = [(charts, ROWS, COLS, .5, valid)]
+    for item in charts:
+        corners, rows, cols, fr = item[:4]
+        v_mask = item[4] if len(item) > 4 else None
+        u, v = uv(fr, 2, rows, cols)
+        p = grid_points(corners, u, v) * sc
+        for r in range(rows):
+            for q in range(cols):
+                a = p[r, q]
+                ok = True if v_mask is None else v_mask[r, q]
+                cv2.rectangle(small, tuple(a[0, 0].astype(int)), tuple(a[1, 1].astype(int)), (0, 255, 255) if ok else (0, 0, 255), 1)
     cv2.imwrite(path, small, [cv2.IMWRITE_JPEG_QUALITY, 88])
 
 
@@ -337,6 +411,15 @@ def de00_parts(a, b):
     SC, SH = 1 + .045 * Cpm, 1 + .015 * Cpm * T
     RT = -2 * np.sqrt(Cpm ** 7 / (Cpm ** 7 + 25 ** 7)) * np.sin(np.radians(60 * np.exp(-((hm - 275) / 25) ** 2)))
     return dL / SL, dC / SC, dH / SH, RT
+
+
+def de00_vec(a, b):
+    """3-component residual (l, u, v) whose Euclidean norm equals CIEDE2000 exactly, including the RT rotation term."""
+    l, c, h, rt = de00_parts(a, b)
+    s2 = math.sqrt(0.5)
+    u = s2 * (c + h) * np.sqrt(np.maximum(1.0 + rt / 2.0, 0.0))
+    v = s2 * (c - h) * np.sqrt(np.maximum(1.0 - rt / 2.0, 0.0))
+    return np.stack([l, u, v], -1)
 
 
 def de00(a, b):
